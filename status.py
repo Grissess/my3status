@@ -37,8 +37,14 @@ class Provider(object):
 
     def process(self):
         if self.should_run():
-            self.cached = self.run()
+            try:
+                self.cached = self.run()
+            except Exception as e:
+                self.cached = self.err_block(e)
         return self.cached
+
+    def err_block(self, exc):
+        return {'color': '#ff00ff', 'full_text': str(exc)}
 
     low_hue = 0.0
     high_hue = 2.0/3.0
@@ -167,6 +173,9 @@ class TemperatureProvider(Provider):
 class BatteryProvider(Provider):
     format = '{status} {remaining} {flow} {voltage} {percentage:.2f}% {bar}'
 
+    missing_color = '#ff00ff'
+    missing_urgent = False
+
     low_value = 0.0
     high_value = 1.0
     crit_value = 0.05
@@ -200,10 +209,27 @@ class BatteryProvider(Provider):
 
         return ret
 
+    def block_missing(self):
+        block = super().run()
+        block['full_text'] = '{battery} MISSING'.format(battery=self.battery)
+        block['color'] = self.missing_color
+        block['urgent'] = self.missing_urgent
+        return block
+
     def run(self):
+        if self.f is None:
+            try:
+                self.f = open('/sys/class/power_supply/{}/uevent'.format(self.battery))
+            except OSError:
+                return self.block_missing()
+
         self.f.seek(0)
         # Strip leading POWER_SUPPLY_
-        info = {k[13:]: v for k,v in self.file_to_dict(self.f).items()}
+        try:
+            info = {k[13:]: v for k,v in self.file_to_dict(self.f).items()}
+        except OSError:
+            self.f = None
+            return self.block_missing()
 
         for k in list(info.keys()):
             if self.MICRO_UNITS.match(k):
