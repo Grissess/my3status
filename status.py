@@ -195,7 +195,7 @@ class BatteryProvider(Provider):
 
     def __init__(self, battery='BAT0'):
         self.battery = battery
-        self.f = open('/sys/class/power_supply/{}/uevent'.format(self.battery))
+        self.f = None
 
     @staticmethod
     def file_to_dict(f):
