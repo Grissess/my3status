@@ -1,0 +1,64 @@
+my3status
+=========
+
+This is a personal-use, Python3-driven status bar that I use on all my i3/sway
+devices. I'm not sure if it'll help you, general user, but you're more than
+welcome to take it.
+
+Here's a little screenshot on my desktop:
+
+![scrot](../eg/scrot.png)
+
+My philosophy is about colors more than numbers; I like being able to tell how
+much battery is left on my laptop from across the room by the color of the
+capacity bar. Similarly, the red/magenta pairings for physmem/CPU indicate that
+something is happening, or requires my attention. (This is my response to the
+now-redacted claim that memory monitoring on i3status is unnecessary, by the
+way: I run swapless systems, where physmem _fullness_ is an important metric
+for me. The color makes it easy to judge this at a glance.)
+
+This script is extensible, but hardly well-packaged. If you're looking for
+something more standardized, consider
+[i3pystatus](https://pypi.org/project/i3pystatus/), the qualms with which
+encouraged me to write my own streamlined version, or [alexbakker's project of
+the same name](https://github.com/alexbakker/my3status), which I discovered
+afterward, and seems both functionally equivalent and more professional than
+this :)
+
+Usage
+-----
+
+Pop this into a place you know about, and set it off in your config with:
+
+	bar {
+		status_command python3 /path/to/status.py
+		# And any other config...
+	}
+
+This works with both Sway and i3, to my knowledge, since both conveniently use
+the same streaming JSON IPC protocol.
+
+Changing what displays, or the order, is done with your favorite text editor.
+Just change the `Provider` instances passed to the `Status` instance. Feel free
+to use the rest of the implementation as reference.
+
+Dependencies
+------------
+
+Presently, this wants these packages:
+
+- `netifaces`, for network interface information (addresses, mostly)
+- `psutil`, for memory info
+- `ddate`, for the Discordian calendar
+
+If you remove the relevant providers, you can, of course, edit this list down.
+Presently, that also entails editing the imports on line 3.
+
+Contributions
+-------------
+
+I use this personally, so don't expect me to put the kitchen sink in here, or
+to be very generous with my inclusion of features _I_ find unnecessary.
+However, you're certainly free to fork this and modify it on your own under the
+terms of the GPLv3, and I could be convinced to merge a PR if it fixes a bug or
+adds a feature I personally like.
