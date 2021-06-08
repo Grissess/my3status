@@ -149,7 +149,7 @@ class Provider(object):
 
     VERTS = ' _▁▂▃▄▅▆▇█'
 
-    def get_vert_bar(self, v, l=0.0, h=1.0, bg='#444444'):
+    def get_vert_bar(self, v, l=0.0, h=1.0, bg='#222222'):
         n = (v - l) / (h - l)
         c = self.VERTS[min((len(self.VERTS) - 1, max((0, int(n * len(self.VERTS))))))]
         if bg is not None:
