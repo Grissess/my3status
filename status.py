@@ -431,7 +431,7 @@ class DDateClockProvider(Provider):
     SH_WEEKDAYS = ['SM', 'BT', 'PN', 'PP', 'SO']
     SH_SEASONS = ['CHA', 'DIS', 'CON', 'BUR', 'AFT']
 
-    def run_common(self, short = False):
+    def run(self):
         dt = ddate.base.DDate()
 
         if dt.season is None:
@@ -449,7 +449,7 @@ class DDateClockProvider(Provider):
         else:
             sd = '{:02}'.format(dt.day_of_season)
 
-        block = super().run_common(short)
+        block = super().run()
         block.update({
             'full_text': '{}-{}-{} {}{}'.format(
                 dt.year, sn, sd, wd,
@@ -457,6 +457,15 @@ class DDateClockProvider(Provider):
             ),
             'color': '#7700FF' if dt.holiday is None else '#FF00FF',
         })
+        return block
+
+    def run_short(self):
+        block = super().run_short()
+        dt = ddate.base.DDate()
+        block.update(
+                full_text = 'DIS',
+                color = '#7700FF' if dt.holiday is None else '#FF00FF',
+        )
         return block
 
 class SimpleClockProvider(Provider):
