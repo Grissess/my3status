@@ -75,7 +75,7 @@ class Provider(object):
     cached = {}
 
     def run_common(self, short = False):
-        return {'color': self.color, 'name': type(self).__name__, 'instance': id(self)}
+        return {'color': self.color, 'name': type(self).__name__, 'instance': id(self), 'markup': 'pango'}
 
     def run(self):
         return self.run_common(False)
@@ -136,18 +136,25 @@ class Provider(object):
     BARS = [' ', '▏', '▎', '▍', '▌', '▋', '▋', '▊', '▊', '█']
     BLOCK = '█' 
 
-    def get_bar(self, v, l=0.0, h=1.0):
+    def get_bar(self, v, l=0.0, h=1.0, bg=None):
         p = int(100.0 * (v - l) / (h - l))
         t, o = divmod(p, 10)
         if o == 0:
-            return (self.BLOCK * t).ljust(10)
-        return (self.BLOCK * t + self.BARS[o]).ljust(10)
+            b = (self.BLOCK * t).ljust(10)
+        else:
+            b = (self.BLOCK * t + self.BARS[o]).ljust(10)
+        if bg is not None:
+            return f'<span background="{bg}">{b}</span>'
+        return b
 
     VERTS = ' _▁▂▃▄▅▆▇█'
 
-    def get_vert_bar(self, v, l=0.0, h=1.0):
+    def get_vert_bar(self, v, l=0.0, h=1.0, bg='#444444'):
         n = (v - l) / (h - l)
-        return self.VERTS[min((len(self.VERTS) - 1, max((0, int(n * len(self.VERTS))))))]
+        c = self.VERTS[min((len(self.VERTS) - 1, max((0, int(n * len(self.VERTS))))))]
+        if bg is not None:
+            return f'<span background="{bg}">{c}</span>'
+        return c
 
 class DiskProvider(Provider):
     crit_free = 1024**3
