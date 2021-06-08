@@ -9,6 +9,10 @@ Here's a little screenshot on my desktop:
 
 ![scrot](../eg/scrot.png)
 
+And on my laptop, with most everything collapsed:
+
+![scrotshort](../eg/scrotshort.png)
+
 My philosophy is about colors more than numbers; I like being able to tell how
 much battery is left on my laptop from across the room by the color of the
 capacity bar. Similarly, the red/magenta pairings for physmem/CPU indicate that
@@ -37,6 +41,12 @@ Pop this into a place you know about, and set it off in your config with:
 
 This works with both Sway and i3, to my knowledge, since both conveniently use
 the same streaming JSON IPC protocol.
+
+As of the version which is being here documented, the modules support a "short"
+mode, which makes them more compact on especially narrow displays (or when you
+have a lot of workspaces open). Modules start "short" by default, and can be
+left-clicked to toggle. Modules also can handle clicks in other ways, but none
+yet do.
 
 Changing what displays, or the order, is done with your favorite text editor.
 Just change the `Provider` instances passed to the `Status` instance. Feel free

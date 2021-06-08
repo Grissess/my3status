@@ -1,29 +1,87 @@
-import json, sys, time, os, colorsys, re
+import json, sys, time, os, colorsys, re, multiprocessing, asyncio, concurrent.futures, traceback
 
 import netifaces, psutil, ddate.base
+
+def get_loop(loop = None):
+    if loop is None:
+        return asyncio.get_running_loop()
+    return loop
 
 class Status(object):
     def __init__(self, *providers, interval = 0.5):
         self.providers = list(providers)
+        self.idmap = {id(provider): provider for provider in providers}
         self.interval = interval
         self.stop = True
+        # We only spawn two coroutines; the third is for any necessary internal
+        # tasks
+        self.executor = concurrent.futures.ThreadPoolExecutor(3)
 
-    def run(self):
-        json.dump({'version': 1}, sys.stdout)
-        print('\n[')
-        self.stop = False
+    def add(self, provider):
+        self.providers.append(provider)
+        self.idmap[id(provider)] = provider
+
+    async def awrite(self, f, data, loop = None):
+        return await get_loop(loop).run_in_executor(self.executor, f.write, data)
+
+    async def aflush(self, f, loop = None):
+        return await get_loop(loop).run_in_executor(self.executor, f.flush)
+
+    async def aread(self, f, bufsz, loop = None):
+        return await get_loop(loop).run_in_executor(self.executor, f.read, bufsz)
+
+    async def areadline(self, f, loop = None):
+        return await get_loop(loop).run_in_executor(self.executor, f.readline)
+
+    async def co_output(self, fo):
+        await self.awrite(fo, json.dumps({'version': 1, 'click_events': True}))
+        await self.awrite(fo, '\n[\n')
         while not self.stop:
             op = [i.process() for i in self.providers]
-            json.dump(op, sys.stdout)
-            print(',', flush=True)
-            time.sleep(self.interval)
+            await self.awrite(fo, json.dumps(op))
+            await self.awrite(fo, ',')
+            await self.aflush(fo)
+            await asyncio.sleep(self.interval)
+        await self.awrite(fo, '\n]\n')
+
+    async def co_input(self, fi):
+        log = open('/tmp/my3status.log', 'w')
+        while not self.stop:
+            line = (await self.areadline(fi)).strip().lstrip(',')
+            if line == '[':  # Beginning of the stream
+                continue
+            if line == ']':  # ... end of the stream?!
+                break
+            try:
+                block = json.loads(line)
+                inst = self.idmap[int(block['instance'])]
+                inst.click(block)
+            except Exception:
+                await self.awrite(log, traceback.format_exc())
+                await self.aflush(log)
+
+    async def co_run(self):
+        return await asyncio.gather(
+                self.co_input(sys.stdin),
+                self.co_output(sys.stdout),
+        )
+
+    def run(self):
+        self.stop = False
+        return asyncio.run(self.co_run())
 
 class Provider(object):
     color = '#ffffff'
     cached = {}
 
+    def run_common(self, short = False):
+        return {'color': self.color, 'name': type(self).__name__, 'instance': id(self)}
+
     def run(self):
-        return {'color': self.color}
+        return self.run_common(False)
+
+    def run_short(self):
+        return self.run_common(True)
 
     interval = None
     last_run = None
@@ -35,16 +93,23 @@ class Provider(object):
         self.last_run = time.time()
         return True
 
+    short = True
     def process(self):
         if self.should_run():
             try:
-                self.cached = self.run()
+                self.cached = self.run_short() if self.short else self.run()
             except Exception as e:
                 self.cached = self.err_block(e)
         return self.cached
 
     def err_block(self, exc):
         return {'color': '#ff00ff', 'full_text': str(exc)}
+
+    def click(self, block):
+        if block['button'] == 1:
+            self.short = not self.short
+            return True
+        return False
 
     low_hue = 0.0
     high_hue = 2.0/3.0
@@ -82,28 +147,35 @@ class Provider(object):
 
     def get_vert_bar(self, v, l=0.0, h=1.0):
         n = (v - l) / (h - l)
-        return self.VERTS[min((len(self.VERTS) - 1, max((0, int(n / len(self.VERTS))))))]
+        return self.VERTS[min((len(self.VERTS) - 1, max((0, int(n * len(self.VERTS))))))]
 
 class DiskProvider(Provider):
     crit_free = 1024**3
-    format = '{free:.2f}G'
+    format = '{path}:{free:.2f}G{vert_bar}'
+    format_short = '{path}:{vert_bar}'
     div = 1024**3
 
     def __init__(self, path):
         self.path = path
 
-    def run(self):
+    def run_common(self, short = False):
         vfs = os.statvfs(self.path)
 
         free = vfs.f_bfree * vfs.f_bsize
+        size = vfs.f_blocks * vfs.f_bsize
+        partial = free / size
 
         fd = {
-            'total': vfs.f_blocks * vfs.f_bsize / self.div,
+            'path': self.path,
+            'total': size / self.div,
             'free': free / self.div,
+            'percent': 100.0 * partial,
+            'bar': self.get_bar(partial),
+            'vert_bar': self.get_vert_bar(partial),
         }
 
-        block = super().run()
-        block['full_text'] = self.format.format(**fd)
+        block = super().run_common(short)
+        block['full_text'] = (self.format_short if short else self.format).format(**fd)
         block['urgent'] = free < self.crit_free
         return block
 
@@ -148,6 +220,15 @@ class NetworkProvider(Provider):
         block['markup'] = 'pango'
         return block
 
+    def run_short(self):
+        block = super().run_short()
+        block['color'] = (self.color_up if
+                any(netifaces.ifaddresses(iface) for iface in netifaces.interfaces() if not self.hide.match(iface))
+                else self.color_down
+        )
+        block['full_text'] = 'NET'
+        return block
+
 class TemperatureProvider(Provider):
     low_value = 20.0
     low_hue = 2.0/3.0
@@ -160,11 +241,11 @@ class TemperatureProvider(Provider):
         self.path = path
         self.f = open(self.path)
 
-    def run(self):
+    def run_common(self, short = False):
         self.f.seek(0)
         temp = float(self.f.read()) / 1000.0
 
-        block = super().run()
+        block = super().run_common(short)
         block['full_text'] = self.format.format(temp=temp)
         block['color'] = self.get_gradient(temp)
         block['urgent'] = temp >= self.crit_temp
@@ -172,6 +253,7 @@ class TemperatureProvider(Provider):
 
 class BatteryProvider(Provider):
     format = '{status} {remaining} {flow} {voltage} {percentage:.2f}% {bar}'
+    format_short = '{status}{percentage:.2f}%{vert_bar}'
 
     missing_color = '#ff00ff'
     missing_urgent = False
@@ -210,18 +292,18 @@ class BatteryProvider(Provider):
         return ret
 
     def block_missing(self):
-        block = super().run()
+        block = super().run_common(False)
         block['full_text'] = '{battery} MISSING'.format(battery=self.battery)
         block['color'] = self.missing_color
         block['urgent'] = self.missing_urgent
         return block
 
-    def run(self):
+    def get_info(self):
         if self.f is None:
             try:
                 self.f = open('/sys/class/power_supply/{}/uevent'.format(self.battery))
             except OSError:
-                return self.block_missing()
+                return None
 
         self.f.seek(0)
         # Strip leading POWER_SUPPLY_
@@ -257,10 +339,19 @@ class BatteryProvider(Provider):
         )
         
         info['bar'] = self.get_bar(partial)
+        info['vert_bar'] = self.get_vert_bar(partial)
         info['percentage'] = 100.0 * partial
+        info['partial'] = partial
 
-        block = super().run()
-        block['full_text'] = self.format.format(**info)
+        return info
+
+    def run_common(self, short = False):
+        info = self.get_info()
+        if info is None:
+            return self.block_missing()
+        partial = info['partial']
+        block = super().run_common(short)
+        block['full_text'] = (self.format_short if short else self.format).format(**info)
         block['color'] = self.get_gradient(partial)
         block['urgent'] = partial <= self.crit_value and info['STATUS'] == 'Discharging'
         block['markup'] = 'pango'
@@ -268,20 +359,21 @@ class BatteryProvider(Provider):
 
 class LoadAverageProvider(Provider):
     path = '/proc/loadavg'
-    format = '{avg1} {avg5}'
-    crit_load = 8.0
+    format = '{avg1} {avg5} {avg15}'
+    format_short = '{avg1}'
+    crit_load = float(multiprocessing.cpu_count())
 
     def __init__(self, path=None):
         if path is not None:
             self.path = path
         self.f = open(self.path)
 
-    def run(self):
+    def run_common(self, short = False):
         self.f.seek(0)
         avg1, avg5, avg15, tasks, lastpid = self.f.read().split(' ', 5)
 
-        block = super().run()
-        block['full_text'] = self.format.format(avg1=avg1, avg5=avg5, avg15=avg15, tasks=tasks)
+        block = super().run_common(short)
+        block['full_text'] = (self.format_short if short else self.format).format(avg1=avg1, avg5=avg5, avg15=avg15, tasks=tasks)
         block['urgent'] = float(avg1) >= self.crit_load
         return block
 
@@ -298,7 +390,7 @@ class CPUBarProvider(Provider):
         self.last_busy = 0
         self.f = open(self.path)
 
-    def run(self):
+    def run_common(self, short = False):
         self.f.seek(0)
         parts = list(map(int, self.f.readline().strip().split()[1:]))
 
@@ -311,8 +403,8 @@ class CPUBarProvider(Provider):
         self.last_total = total
         self.last_busy = busy
 
-        block = super().run()
-        block['full_text'] = self.get_bar(value)
+        block = super().run_common(short)
+        block['full_text'] = self.get_vert_bar(value) if self.short else self.get_bar(value)
         block['color'] = self.get_gradient(value)
         return block
 
@@ -320,11 +412,11 @@ class MemBarProvider(Provider):
     low_hue = 1.0/3.0
     high_hue = 0.0
 
-    def run(self):
+    def run_common(self, short = False):
         vmem = psutil.virtual_memory()
 
-        block = super().run()
-        block['full_text'] = self.get_bar(vmem.percent, 0.0, 100.0)
+        block = super().run_common(short)
+        block['full_text'] = self.get_vert_bar(vmem.percent, 0.0, 100.0) if short else self.get_bar(vmem.percent, 0.0, 100.0)
         block['color'] = self.get_gradient(vmem.percent)
         return block
 
@@ -332,7 +424,7 @@ class DDateClockProvider(Provider):
     SH_WEEKDAYS = ['SM', 'BT', 'PN', 'PP', 'SO']
     SH_SEASONS = ['CHA', 'DIS', 'CON', 'BUR', 'AFT']
 
-    def run(self):
+    def run_common(self, short = False):
         dt = ddate.base.DDate()
 
         if dt.season is None:
@@ -350,7 +442,7 @@ class DDateClockProvider(Provider):
         else:
             sd = '{:02}'.format(dt.day_of_season)
 
-        block = super().run()
+        block = super().run_common(short)
         block.update({
             'full_text': '{}-{}-{} {}{}'.format(
                 dt.year, sn, sd, wd,
@@ -362,11 +454,12 @@ class DDateClockProvider(Provider):
 
 class SimpleClockProvider(Provider):
     format = '%Y-%m-%d<span foreground="#0000ff">T</span>%H:%M:%S<span color="#007700">%z %Z W%W J%j</span>'
+    format_short = '%H:%M:%S'
 
-    def run(self):
-        block = super().run()
+    def run_common(self, short = False):
+        block = super().run_common(short)
         block.update({
-            'full_text': time.strftime(self.format, getattr(self, 'timefunc', time.localtime)()),
+            'full_text': time.strftime(self.format_short if short else self.format, getattr(self, 'timefunc', time.localtime)()),
             'color': self.color,
             'markup': 'pango',
         })
@@ -401,19 +494,26 @@ class GMDiffClockProvider(SimpleClockProvider):
         })
         return block
 
+    def run_short(self):
+        block = super().run_short()
+        block['full_text'] = 'GMT'
+        return block
+
 if __name__ == '__main__':
     dp_root = DiskProvider('/')
     dp_root.color = '#0077ff'
-    dp_home = DiskProvider('/home')
-    dp_home.color = '#00ffff'
+    #dp_home = DiskProvider('/home')
+    #dp_home.color = '#00ffff'
     la = LoadAverageProvider()
     la.color = '#000077'
+    bp = BatteryProvider()
+    bp.voltage_high = 8.45
     Status(
         dp_root,
-        dp_home,
+        #dp_home,
         NetworkProvider(),
-        BatteryProvider(),
         TemperatureProvider(),
+        bp,
         la,
         CPUBarProvider(),
         MemBarProvider(),
