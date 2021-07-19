@@ -229,8 +229,9 @@ class NetworkProvider(Provider):
 
     def run_short(self):
         block = super().run_short()
+        afs = set(self.priority)
         block['color'] = (self.color_up if
-                any(netifaces.ifaddresses(iface) for iface in netifaces.interfaces() if not self.hide.match(iface))
+                any(set(netifaces.ifaddresses(iface).keys()) & afs for iface in netifaces.interfaces() if not self.hide.match(iface))
                 else self.color_down
         )
         block['full_text'] = 'NET'
@@ -257,6 +258,17 @@ class TemperatureProvider(Provider):
         block['color'] = self.get_gradient(temp)
         block['urgent'] = temp >= self.crit_temp
         return block
+
+    @classmethod
+    def all(cls, root='/sys/class/thermal/'):
+        for ent in os.listdir(root):
+            if not ent.startswith('thermal_zone'):
+                continue
+            path = os.path.join(root, ent, 'temp')
+            if not os.path.exists(path):
+                continue
+            yield cls(path)
+
 
 class BatteryProvider(Provider):
     format = '{status} {remaining} {flow} {voltage} {percentage:.2f}% {bar}'
@@ -481,7 +493,7 @@ class SimpleClockProvider(Provider):
         })
         return block
 
-class GMDiffClockProvider(SimpleClockProvider):
+class UTDiffClockProvider(SimpleClockProvider):
     timefunc = time.gmtime
     format = '<error>'
     color = '#777700'
@@ -512,7 +524,7 @@ class GMDiffClockProvider(SimpleClockProvider):
 
     def run_short(self):
         block = super().run_short()
-        block['full_text'] = 'GMT'
+        block['full_text'] = 'UTC'
         return block
 
 if __name__ == '__main__':
@@ -528,12 +540,12 @@ if __name__ == '__main__':
         dp_root,
         #dp_home,
         NetworkProvider(),
-        TemperatureProvider(),
+        *TemperatureProvider.all(),
         bp,
         la,
         CPUBarProvider(),
         MemBarProvider(),
-        GMDiffClockProvider(),
+        UTDiffClockProvider(),
         SimpleClockProvider(),
         DDateClockProvider(),
     ).run()
