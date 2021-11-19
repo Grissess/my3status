@@ -21,26 +21,32 @@ class SleepBiasWaiter(object):
         self.bias_corr = 0.0
         self.interval_corr = 1.0
         self.reset = True
+        self.start = None
 
     async def wait(self):
-        now = time.clock_gettime(self.clock)  # this is the point we want to sync to bias
-        if not self.reset:
-            dt = (now - self.bias) % self.interval / self.interval
-            if dt >= 0.5:
-                dt -= 1.0
-            delta_bias = self.corr * dt
-            self.bias_corr += delta_bias
-            self.bias_corr %= self.interval
-            self.interval_corr *= 1.0 - (self.icorr * delta_bias)
-            #print('dt:', dt, 'db:', delta_bias, 'bias_corr:', self.bias_corr, 'interval_corr:', self.interval_corr, file=sys.stderr)
-        self.reset = False
-        ci = self.interval_corr * self.interval
-        dur = ci * (1.0 - (now / self.interval - int(now / self.interval)))
-        if dur < self.minint * ci:
-            # Usually because we missed a goal slightly early due to jitter
-            dur += ci
-        #print('Sleep:', dur, file=sys.stderr)
-        await asyncio.sleep(dur)
+        if self.start is not None:
+            now = self.start
+            if not self.reset:
+                dt = (now - self.bias) % self.interval / self.interval
+                if dt >= 0.5:
+                    dt -= 1.0
+                delta_bias = self.corr * dt
+                self.bias_corr += delta_bias
+                self.bias_corr %= self.interval
+                self.interval_corr *= 1.0 - (self.icorr * delta_bias)
+                #print('dt:', dt, 'db:', delta_bias, 'bias_corr:', self.bias_corr, 'interval_corr:', self.interval_corr, file=sys.stderr)
+            else:
+                self.bias_corr = 0.0
+                self.interval_corr = 1.0
+            self.reset = False
+            ci = self.interval_corr * self.interval
+            dur = ci * (1.0 - (now / self.interval - int(now / self.interval)))
+            if dur < self.minint * ci:
+                # Usually because we missed a goal slightly early due to jitter
+                dur += ci
+            #print('Sleep:', dur, file=sys.stderr)
+            await asyncio.sleep(dur)
+        self.start = time.clock_gettime(self.clock)  # this is the point we want to sync to bias
 
 class Status(object):
     def __init__(self, *providers, waiter = SleepBiasWaiter(0.5)):
@@ -80,7 +86,7 @@ class Status(object):
         await self.awrite(fo, '\n]\n')
 
     async def co_input(self, fi):
-        log = open('/tmp/my3status.log', 'w')
+        #log = open('/tmp/my3status.log', 'w')
         while not self.stop:
             line = (await self.areadline(fi)).strip().lstrip(',')
             if line == '[':  # Beginning of the stream
@@ -607,8 +613,11 @@ class UTDiffClockProvider(SimpleClockProvider):
         return block
 
 class BiasSleepInfo(Provider):
-    format = '{bias:.03f},{ival:.03f}'
-    format_short = 'B'
+    format = 'I:{intv:.01f},dT:{bias:.03f},dI:{ival:.03f}'
+    format_short = 'TC'
+
+    times = (0.1, 0.5, 1.0)
+    time_cur = 1
 
     def __init__(self, waiter):
         self.waiter = waiter
@@ -618,8 +627,26 @@ class BiasSleepInfo(Provider):
         block['full_text'] = (self.format_short if short else self.format).format(
                 bias=self.waiter.bias_corr,
                 ival=self.waiter.interval_corr * self.waiter.interval,
+                intv=self.waiter.interval,
         )
         return block
+
+    def click(self, block):
+        if super().click(block):
+            return True
+        if block['button'] in (4, 5):
+            if block['button'] == 4:
+                self.time_cur += 1
+                if self.time_cur >= len(self.times):
+                    self.time_cur = len(self.times) - 1
+            else:
+                self.time_cur -= 1
+                if self.time_cur < 0:
+                    self.time_cur = 0
+            self.waiter.interval = self.times[self.time_cur]
+            self.waiter.reset = True
+            return True
+        return False
 
 if __name__ == '__main__':
     dp_root = DiskProvider('/')
@@ -631,13 +658,13 @@ if __name__ == '__main__':
     bp = BatteryProvider()
     bp.voltage_high = 8.45
     # A little bias to keep the bar clock ticking at a consistent rate
-    waiter = SleepBiasWaiter(0.5, 0.01)
+    waiter = SleepBiasWaiter(0.5)
     bsi = BiasSleepInfo(waiter)
     bsi.color = '#770077'
     #bsi.short = False
     sc = SimpleClockProvider()
     sc.short = False
-    Status(
+    st = Status(
         dp_root,
         #dp_home,
         NetworkProvider(),
@@ -652,4 +679,8 @@ if __name__ == '__main__':
         DDateClockProvider(),
         bsi,
         waiter = waiter,
-    ).run()
+    )
+    for prov in st.providers:
+        if not isinstance(prov, SimpleClockProvider):
+            prov.interval = 0.5
+    st.run()
