@@ -1,4 +1,4 @@
-import json, sys, time, os, colorsys, re, multiprocessing, asyncio, concurrent.futures, traceback
+import json, sys, time, os, colorsys, re, multiprocessing, asyncio, concurrent.futures, traceback, math
 
 import netifaces, psutil, ddate.base
 
@@ -7,11 +7,37 @@ def get_loop(loop = None):
         return asyncio.get_running_loop()
     return loop
 
+class SleepWaiter(object):
+    def __init__(self, interval):
+        self.interval = interval
+
+    async def wait(self):
+        await asyncio.sleep(self.interval)
+
+class SleepBiasWaiter(object):
+    def __init__(self, interval, bias = 0.0, corr = 0.1, clock = time.CLOCK_REALTIME, min_wait = 0.05):
+        self.interval, self.bias, self.corr, self.clock, self.min_wait = interval, bias, corr, clock, min_wait
+        self.bias_corr = 0.0
+        self.reset = True
+
+    async def wait(self):
+        now = time.clock_gettime(self.clock)  # this is the point we want to sync to bias
+        if not self.reset:
+            self.bias_corr += self.corr * self.interval * (now % self.interval)
+            self.bias_corr %= self.interval
+        self.reset = False
+        dur = max(
+                self.min_wait,
+                self.interval * (1.0 - (now / self.interval - int(now / self.interval)))
+        )
+        print('Sleep:', dur, file=sys.stderr)
+        await asyncio.sleep(dur)
+
 class Status(object):
-    def __init__(self, *providers, interval = 0.5):
+    def __init__(self, *providers, waiter = SleepBiasWaiter(0.5)):
         self.providers = list(providers)
         self.idmap = {id(provider): provider for provider in providers}
-        self.interval = interval
+        self.waiter = waiter
         self.stop = True
         # We only spawn two coroutines; the third is for any necessary internal
         # tasks
@@ -41,7 +67,7 @@ class Status(object):
             await self.awrite(fo, json.dumps(op))
             await self.awrite(fo, ',')
             await self.aflush(fo)
-            await asyncio.sleep(self.interval)
+            await self.waiter.wait()
         await self.awrite(fo, '\n]\n')
 
     async def co_input(self, fi):
@@ -191,6 +217,9 @@ class NetworkProvider(Provider):
     color_down = '#333333'
     format_up = '{addr}/{bits}'
     color_up = '#777777'
+    format_multiple = '{addr}/{bits}({num}/{total})'
+    color_multiple = '#77cc77'
+    cycle_period = 2
 
     hide = re.compile(r'lo|sit.*|ip6tnl.*|.*\.\d+')
     priority = (netifaces.AF_INET, netifaces.AF_INET6)
@@ -214,10 +243,20 @@ class NetworkProvider(Provider):
                 data = addrs.get(af)
                 if not data:
                     continue
-                data = data[0]
-                data['interface'] = iface
-                data['bits'] = self.bits_in_ipv4(data['netmask']) if af == netifaces.AF_INET else int(self.ENDMASK.match(data['netmask']).group(1))
-                texts.append('<span foreground="{}">{}</span>'.format(self.color_up, self.format_up.format(**data)))
+                if len(data) == 1:
+                    data = data[0]
+                    data['interface'] = iface
+                    data['bits'] = self.bits_in_ipv4(data['netmask']) if af == netifaces.AF_INET else int(self.ENDMASK.match(data['netmask']).group(1))
+                    texts.append('<span foreground="{}">{}</span>'.format(self.color_up, self.format_up.format(**data)))
+                else:
+                    size = len(data)
+                    index = int(time.time() / self.cycle_period) % size
+                    data = data[index]
+                    data['num'] = index + 1
+                    data['total'] = size
+                    data['interface'] = iface
+                    data['bits'] = self.bits_in_ipv4(data['netmask']) if af == netifaces.AF_INET else int(self.ENDMASK.match(data['netmask']).group(1))
+                    texts.append('<span foreground="{}">{}</span>'.format(self.color_multiple, self.format_multiple.format(**data)))
                 break
             else:
                 texts.append('<span foreground="{}">{}</span>'.format(self.color_down, self.format_down.format(interface=iface)))
@@ -243,7 +282,7 @@ class TemperatureProvider(Provider):
     high_value = 70.0
     high_hue = 0.0
     crit_temp = 80.0
-    format = '{temp:.0f}C'
+    format = '{tempmg:.0f}mG'
 
     def __init__(self, path='/sys/class/thermal/thermal_zone0/temp'):
         self.path = path
@@ -254,7 +293,7 @@ class TemperatureProvider(Provider):
         temp = float(self.f.read()) / 1000.0
 
         block = super().run_common(short)
-        block['full_text'] = self.format.format(temp=temp)
+        block['full_text'] = self.format.format(temp=temp, tempmg=temp*10)
         block['color'] = self.get_gradient(temp)
         block['urgent'] = temp >= self.crit_temp
         return block
@@ -481,13 +520,44 @@ class DDateClockProvider(Provider):
         return block
 
 class SimpleClockProvider(Provider):
-    format = '%Y-%m-%d<span foreground="#0000ff">T</span>%H:%M:%S<span color="#007700">%z %Z W%W J%j</span>'
-    format_short = '%H:%M:%S'
+    format = '%Y-%m-%d<span color="#0000ff">T</span>%H:%M:%S<span color="#555555">.%Nm</span><span color="#007700">%z %Z W%W J%j</span>'
+    format_short = '%H:%M:%S<span foreground="#555555">.%Nd</span>'
+    subsecs_pattern = re.compile('%N([dcmunf])')
 
     def run_common(self, short = False):
         block = super().run_common(short)
+        # Hypothesis: since its precision is lacking in struct_time, there is no fractional time offset
+        now = time.clock_gettime(time.CLOCK_REALTIME)
+        frac = now - int(now)
+        subs = {
+                'd': '{:01d}'.format(int(frac*10)),
+                'c': '{:02d}'.format(int(frac*100)),
+                'm': '{:03d}'.format(int(frac*1000)),
+                'u': '{:06d}'.format(int(frac*1000000)),
+                'n': '{:09d}'.format(int(frac*1000000000)),
+                'f': str(frac),
+        }
+        def repl(mo):
+            return subs[mo.group(1)]
+        fo = self.subsecs_pattern.sub(repl, self.format_short if short else self.format)
         block.update({
-            'full_text': time.strftime(self.format_short if short else self.format, getattr(self, 'timefunc', time.localtime)()),
+            'full_text': time.strftime(fo, getattr(self, 'timefunc', time.localtime)(now)),
+            'color': self.color,
+            'markup': 'pango',
+        })
+        return block
+
+class CentClockProvider(Provider):
+    format = '{ch:01d}:{cm:02d}:{cs:02d}'
+    color = '#007777'
+
+    def run_common(self, short = False):
+        tinfo = getattr(self, 'timefunc', time.localtime)()
+        secs = tinfo.tm_hour * 3600 + tinfo.tm_min * 60 + tinfo.tm_sec
+        ch, cm, cs = secs // 10000, secs // 100 % 100, secs % 100
+        block = super().run_common(short)
+        block.update({
+            'full_text': self.format.format(ch=ch, cm=cm, cs=cs),
             'color': self.color,
             'markup': 'pango',
         })
@@ -527,6 +597,18 @@ class UTDiffClockProvider(SimpleClockProvider):
         block['full_text'] = 'UTC'
         return block
 
+class BiasSleepInfo(Provider):
+    format = '{bias:.03f}'
+    format_short = 'B'
+
+    def __init__(self, waiter):
+        self.waiter = waiter
+
+    def run_common(self, short = False):
+        block = super().run_common(short)
+        block['full_text'] = (self.format_short if short else self.format).format(bias=self.waiter.bias_corr)
+        return block
+
 if __name__ == '__main__':
     dp_root = DiskProvider('/')
     dp_root.color = '#0077ff'
@@ -536,6 +618,9 @@ if __name__ == '__main__':
     la.color = '#000077'
     bp = BatteryProvider()
     bp.voltage_high = 8.45
+    waiter = SleepBiasWaiter(0.5)
+    bsi = BiasSleepInfo(waiter)
+    bsi.color = '#770077'
     Status(
         dp_root,
         #dp_home,
@@ -545,7 +630,10 @@ if __name__ == '__main__':
         la,
         CPUBarProvider(),
         MemBarProvider(),
+        CentClockProvider(),
         UTDiffClockProvider(),
         SimpleClockProvider(),
         DDateClockProvider(),
+        bsi,
+        waiter = waiter,
     ).run()
