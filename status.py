@@ -15,22 +15,31 @@ class SleepWaiter(object):
         await asyncio.sleep(self.interval)
 
 class SleepBiasWaiter(object):
-    def __init__(self, interval, bias = 0.0, corr = 0.1, clock = time.CLOCK_REALTIME, min_wait = 0.05):
-        self.interval, self.bias, self.corr, self.clock, self.min_wait = interval, bias, corr, clock, min_wait
+    def __init__(self, interval, bias = 0.0, corr = 0.1, icorr = 0.5, minint = 0.25, clock = time.CLOCK_REALTIME):
+        self.interval, self.bias, self.clock = interval, bias, clock
+        self.corr, self.icorr, self.minint = corr, icorr, minint
         self.bias_corr = 0.0
+        self.interval_corr = 1.0
         self.reset = True
 
     async def wait(self):
         now = time.clock_gettime(self.clock)  # this is the point we want to sync to bias
         if not self.reset:
-            self.bias_corr += self.corr * self.interval * (now % self.interval)
+            dt = (now - self.bias) % self.interval / self.interval
+            if dt >= 0.5:
+                dt -= 1.0
+            delta_bias = self.corr * dt
+            self.bias_corr += delta_bias
             self.bias_corr %= self.interval
+            self.interval_corr *= 1.0 - (self.icorr * delta_bias)
+            #print('dt:', dt, 'db:', delta_bias, 'bias_corr:', self.bias_corr, 'interval_corr:', self.interval_corr, file=sys.stderr)
         self.reset = False
-        dur = max(
-                self.min_wait,
-                self.interval * (1.0 - (now / self.interval - int(now / self.interval)))
-        )
-        print('Sleep:', dur, file=sys.stderr)
+        ci = self.interval_corr * self.interval
+        dur = ci * (1.0 - (now / self.interval - int(now / self.interval)))
+        if dur < self.minint * ci:
+            # Usually because we missed a goal slightly early due to jitter
+            dur += ci
+        #print('Sleep:', dur, file=sys.stderr)
         await asyncio.sleep(dur)
 
 class Status(object):
@@ -598,7 +607,7 @@ class UTDiffClockProvider(SimpleClockProvider):
         return block
 
 class BiasSleepInfo(Provider):
-    format = '{bias:.03f}'
+    format = '{bias:.03f},{ival:.03f}'
     format_short = 'B'
 
     def __init__(self, waiter):
@@ -606,7 +615,10 @@ class BiasSleepInfo(Provider):
 
     def run_common(self, short = False):
         block = super().run_common(short)
-        block['full_text'] = (self.format_short if short else self.format).format(bias=self.waiter.bias_corr)
+        block['full_text'] = (self.format_short if short else self.format).format(
+                bias=self.waiter.bias_corr,
+                ival=self.waiter.interval_corr * self.waiter.interval,
+        )
         return block
 
 if __name__ == '__main__':
@@ -618,9 +630,13 @@ if __name__ == '__main__':
     la.color = '#000077'
     bp = BatteryProvider()
     bp.voltage_high = 8.45
-    waiter = SleepBiasWaiter(0.5)
+    # A little bias to keep the bar clock ticking at a consistent rate
+    waiter = SleepBiasWaiter(0.5, 0.01)
     bsi = BiasSleepInfo(waiter)
     bsi.color = '#770077'
+    #bsi.short = False
+    sc = SimpleClockProvider()
+    sc.short = False
     Status(
         dp_root,
         #dp_home,
@@ -632,7 +648,7 @@ if __name__ == '__main__':
         MemBarProvider(),
         CentClockProvider(),
         UTDiffClockProvider(),
-        SimpleClockProvider(),
+        sc,
         DDateClockProvider(),
         bsi,
         waiter = waiter,
