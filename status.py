@@ -1,4 +1,4 @@
-import json, sys, time, os, colorsys, re, multiprocessing, asyncio, concurrent.futures, traceback, math
+import json, sys, time, os, colorsys, re, multiprocessing, asyncio, concurrent.futures, traceback, math, ctypes, signal
 
 import netifaces, psutil, ddate.base
 
@@ -34,7 +34,7 @@ class SleepBiasWaiter(object):
                 self.bias_corr += delta_bias
                 self.bias_corr %= self.interval
                 self.interval_corr *= 1.0 - (self.icorr * delta_bias)
-                #print('dt:', dt, 'db:', delta_bias, 'bias_corr:', self.bias_corr, 'interval_corr:', self.interval_corr, file=sys.stderr)
+                #print('dt:', dt, 'db:', delta_bias, 'bias_corr:', self.bias_corr, 'interval_corr:', self.intval_corr, file=sys.stderr)
             else:
                 self.bias_corr = 0.0
                 self.interval_corr = 1.0
@@ -48,19 +48,89 @@ class SleepBiasWaiter(object):
             await asyncio.sleep(dur)
         self.start = time.clock_gettime(self.clock)  # this is the point we want to sync to bias
 
+class Timespec(ctypes.Structure):
+    _fields_ = [('sec', ctypes.c_long), ('nsec', ctypes.c_long)]
+class ITimerSpec(ctypes.Structure):
+    _fields_ = [('interval', Timespec), ('value', Timespec)]
+p_ITimerSpec = ctypes.POINTER(ITimerSpec)
+class PosixTimerWaiter(object):
+    f_timer_create = ctypes.CFUNCTYPE(
+            ctypes.c_int,
+            ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+            use_errno = True,
+    )
+    pi_timer_create = (
+            (1, 'clockid', time.CLOCK_REALTIME),
+            (1, 'evp', None),
+            (2, 'timerid'),
+    )
+    f_timer_settime = ctypes.CFUNCTYPE(
+            ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_int, p_ITimerSpec, p_ITimerSpec,
+            use_errno = True,
+    )
+    pi_timer_settime = (
+            (1, 'timerid'),
+            (1, 'flags', 0),
+            (1, 'new_value'),
+            (2, 'old_value'),
+    )
+    TIMER_ABSTIME = 1
+
+    def __init__(self, interval, clock = time.CLOCK_REALTIME):
+        self.interval = interval
+        self.lib = ctypes.CDLL('librt.so.1')
+        self.timer_create = self.f_timer_create(('timer_create', self.lib), self.pi_timer_create)
+        self.timer_settime = self.f_timer_settime(('timer_settime', self.lib), self.pi_timer_settime)
+        self.clock = clock
+        self.timer = self.timer_create(clock)
+        async def open_gate(cond):
+            async with cond:
+                cond.notify(1)
+        def on_alarm(loop, coro, args):
+            asyncio.run_coroutine_threadsafe(coro(*args), loop)
+        self.signal_setup = (open_gate, on_alarm)
+
+    def install_sighand(self):
+        if self.signal_setup is not None:
+            loop = asyncio.get_event_loop()
+            self.gate = asyncio.Condition()
+            open_gate, on_alarm = self.signal_setup
+            loop.add_signal_handler(signal.SIGALRM, on_alarm, loop, open_gate, (self.gate,))
+            self.signal_setup = None
+
+    async def wait(self):
+        self.install_sighand()
+        now = time.clock_gettime(self.clock)
+        nxt = math.ceil(now / self.interval) * self.interval
+        nxs = int(nxt)
+        nxns = int(1e9 * (nxt - nxs))
+        self.timer_settime(
+                self.timer,
+                self.TIMER_ABSTIME,
+                ITimerSpec((0, 0), (nxs, nxns)),
+        )
+        async with self.gate:
+            await self.gate.wait()
+
 class Status(object):
     def __init__(self, *providers, waiter = SleepBiasWaiter(0.5)):
         self.providers = list(providers)
         self.idmap = {id(provider): provider for provider in providers}
+        self.reschedule()
         self.waiter = waiter
         self.stop = True
         # We only spawn two coroutines; the third is for any necessary internal
         # tasks
         self.executor = concurrent.futures.ThreadPoolExecutor(3)
 
+    def reschedule(self):
+        self.prov_order = sorted(enumerate(self.providers), key = lambda pr: pr[1].priority, reverse = True)
+
     def add(self, provider):
         self.providers.append(provider)
         self.idmap[id(provider)] = provider
+        self.reschedule()
 
     async def awrite(self, f, data, loop = None):
         return await get_loop(loop).run_in_executor(self.executor, f.write, data)
@@ -78,11 +148,15 @@ class Status(object):
         await self.awrite(fo, json.dumps({'version': 1, 'click_events': True}))
         await self.awrite(fo, '\n[\n')
         while not self.stop:
-            op = [i.process() for i in self.providers]
+            op = [None] * len(self.providers)
+            for i, p in self.prov_order:
+                op[i] = p.process()
             await self.awrite(fo, json.dumps(op))
             await self.awrite(fo, ',')
             await self.aflush(fo)
+            self.waiter.start_time = time.clock_gettime(time.CLOCK_REALTIME)
             await self.waiter.wait()
+            self.waiter.end_time = time.clock_gettime(time.CLOCK_REALTIME)
         await self.awrite(fo, '\n]\n')
 
     async def co_input(self, fi):
@@ -114,6 +188,7 @@ class Status(object):
 class Provider(object):
     color = '#ffffff'
     cached = {}
+    priority = 0
 
     def run_common(self, short = False):
         return {'color': self.color, 'name': type(self).__name__, 'instance': id(self), 'markup': 'pango'}
@@ -237,7 +312,7 @@ class NetworkProvider(Provider):
     cycle_period = 2
 
     hide = re.compile(r'lo|sit.*|ip6tnl.*|.*\.\d+')
-    priority = (netifaces.AF_INET, netifaces.AF_INET6)
+    af_priority = (netifaces.AF_INET, netifaces.AF_INET6)
     sep = ' '
 
     ENDMASK = re.compile(r'.*/(\d+)$')
@@ -254,7 +329,7 @@ class NetworkProvider(Provider):
                 continue
 
             addrs = netifaces.ifaddresses(iface)
-            for af in self.priority:
+            for af in self.af_priority:
                 data = addrs.get(af)
                 if not data:
                     continue
@@ -283,7 +358,7 @@ class NetworkProvider(Provider):
 
     def run_short(self):
         block = super().run_short()
-        afs = set(self.priority)
+        afs = set(self.af_priority)
         block['color'] = (self.color_up if
                 any(set(netifaces.ifaddresses(iface).keys()) & afs for iface in netifaces.interfaces() if not self.hide.match(iface))
                 else self.color_down
@@ -612,23 +687,41 @@ class UTDiffClockProvider(SimpleClockProvider):
         block['full_text'] = 'UTC'
         return block
 
-class BiasSleepInfo(Provider):
-    format = 'I:{intv:.01f},dT:{bias:.03f},dI:{ival:.03f}'
-    format_short = 'TC'
+class WaiterInfo(Provider):
+    other_format = 'I:{intv:.02f},SB:{sowb:.03f},EB:{eowb:.03f}'
+    other_format_short = 'TC'
 
-    times = (0.1, 0.5, 1.0)
-    time_cur = 1
+    sbw_format = 'I:{intv:.02f},dT:{bias:.03f},dI:{ival:.03f},SB:{sowb:.03f},EB:{eowb:.03f}'
+    sbw_format_short = 'TC'
+
+    times = (0.01, 0.05, 0.1, 0.5, 1.0)
+    time_cur = 4
 
     def __init__(self, waiter):
         self.waiter = waiter
 
     def run_common(self, short = False):
         block = super().run_common(short)
-        block['full_text'] = (self.format_short if short else self.format).format(
-                bias=self.waiter.bias_corr,
-                ival=self.waiter.interval_corr * self.waiter.interval,
-                intv=self.waiter.interval,
-        )
+        intv = self.waiter.interval
+        sowt = getattr(self.waiter, 'start_time', 0.0)
+        eowt = getattr(self.waiter, 'end_time', 0.0)
+        common = {
+                'intv': intv,
+                'sowt': sowt,
+                'eowt': eowt,
+                'sowb': sowt % intv,
+                'eowb': eowt % intv,
+        }
+        if isinstance(self.waiter, SleepBiasWaiter):
+            block['full_text'] = (self.sbw_format_short if short else self.sbw_format).format(
+                    bias=self.waiter.bias_corr,
+                    ival=self.waiter.interval_corr * self.waiter.interval,
+                    **common
+            )
+        else:
+            block['full_text'] = (self.other_format_short if short else self.other_format).format(
+                    **common
+            )
         return block
 
     def click(self, block):
@@ -658,12 +751,14 @@ if __name__ == '__main__':
     bp = BatteryProvider()
     bp.voltage_high = 8.45
     # A little bias to keep the bar clock ticking at a consistent rate
-    waiter = SleepBiasWaiter(0.5)
-    bsi = BiasSleepInfo(waiter)
+    #waiter = SleepBiasWaiter(1.0)
+    waiter = PosixTimerWaiter(1.0)
+    bsi = WaiterInfo(waiter)
     bsi.color = '#770077'
     #bsi.short = False
     sc = SimpleClockProvider()
     sc.short = False
+    sc.priority = 10
     st = Status(
         dp_root,
         #dp_home,
