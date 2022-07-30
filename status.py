@@ -232,7 +232,11 @@ class Provider(object):
     low_value = 0.0
     high_value = 100.0
 
-    def get_gradient(self, v, sat=1.0, val=1.0, l=None, h=None, lh=None, hh=None):
+    def get_gradient(self, v,
+                     l=None, h=None,
+                     lh=None, hh=None,
+                     ls=1.0, hs=1.0,
+                     lv=1.0, hv=1.0):
         if l is None:
             l = self.low_value
         if h is None:
@@ -242,35 +246,38 @@ class Provider(object):
         if hh is None:
             hh = self.high_hue
         clamped = min((h, max((l, v))))
-        r, g, b = colorsys.hsv_to_rgb(
-            lh + (hh - lh) * (clamped - l) / (h - l),
-            sat, val,
-        )
+        ratio = (clamped - l) / (h - l)
+        lerp = lambda l, h, ratio=ratio: ratio * h + (1 - ratio) * l
+        r, g, b = colorsys.hsv_to_rgb(lerp(lh, hh), lerp(ls, hs), lerp(lv, hv))
         r, g, b = tuple(min((int(i*256), 255)) for i in (r, g, b))
         return '#{:02x}{:02x}{:02x}'.format(r, g, b)
 
     BARS = [' ', '▏', '▎', '▍', '▌', '▋', '▋', '▊', '▊', '█']
     BLOCK = '█' 
 
-    def get_bar(self, v, l=0.0, h=1.0, bg=None):
+    def get_bar(self, v, l=0.0, h=1.0, bg=None, fg=None):
         p = int(100.0 * (v - l) / (h - l))
         t, o = divmod(p, 10)
         if o == 0:
             b = (self.BLOCK * t).ljust(10)
         else:
             b = (self.BLOCK * t + self.BARS[o]).ljust(10)
-        if bg is not None:
-            return f'<span background="{bg}">{b}</span>'
-        return b
+        fgs = '' if fg is None else f' foreground="{fg}"'
+        bgs = '' if bg is None else f' background="{bg}"'
+        if not (fgs or bgs):
+            return b
+        return f'<span{fgs}{bgs}>{b}</span>'
 
     VERTS = ' _▁▂▃▄▅▆▇█'
 
-    def get_vert_bar(self, v, l=0.0, h=1.0, bg='#222222'):
+    def get_vert_bar(self, v, l=0.0, h=1.0, bg='#222222', fg=None):
         n = (v - l) / (h - l)
         c = self.VERTS[min((len(self.VERTS) - 1, max((0, int(n * len(self.VERTS))))))]
-        if bg is not None:
-            return f'<span background="{bg}">{c}</span>'
-        return c
+        fgs = '' if fg is None else f' foreground="{fg}"'
+        bgs = '' if bg is None else f' background="{bg}"'
+        if not (fgs or bgs):
+            return c
+        return f'<span{fgs}{bgs}>{c}</span>'
 
 class DiskProvider(Provider):
     crit_free = 1024**3
@@ -390,7 +397,7 @@ class TemperatureProvider(Provider):
 
     @classmethod
     def all(cls, root='/sys/class/thermal/'):
-        for ent in os.listdir(root):
+        for ent in sorted(os.listdir(root)):
             if not ent.startswith('thermal_zone'):
                 continue
             path = os.path.join(root, ent, 'temp')
@@ -528,14 +535,17 @@ class LoadAverageProvider(Provider):
 class CPUBarProvider(Provider):
     path = '/proc/stat'
 
-    low_value = 0.0
-    high_value = 1.0
-    low_hue = 2.0/3.0
-    high_hue = 5.0/6.0
+    low_hues = [2.0/3.0, 2.0/3.0, 0.0, 2.0/3.0, 1.0/3.0, 1.0/3.0, 0.0, 1.0/2.0, 1.0/2.0]
+    high_hues = [5.0/6.0, 5.0/6.0, 5.0/6.0, 1.0/2.0, 1.0/6.0, 1.0/6.0, 0.0, 1.0/2.0, 1.0/2.0]
+    low_sats = [1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    high_sats = [1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    low_vals = [1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.5, 0.0, 0.0, 0.0]
+    high_vals = [1.0, 1.0, 1.0, 0.5, 1.0, 1.0, 0.5, 1.0, 1.0, 1.0]
+    bgs = ['#000011', '#000011', '#110000', '#110011', '#001111', '#001100', '#001100', '#110000', '#001111', '#001111']
 
     def __init__(self):
         self.last_total = 0
-        self.last_busy = 0
+        self.last = [0, 0, 0, 0, 0, 0, 0]
         self.f = open(self.path)
 
     def run_common(self, short = False):
@@ -543,17 +553,32 @@ class CPUBarProvider(Provider):
         parts = list(map(int, self.f.readline().strip().split()[1:]))
 
         total = sum(parts)
-        del parts[3:5]
-        busy = sum(parts)
-
-        value = (busy - self.last_busy) / (total - self.last_total)
-        
+        total_delta = total - self.last_total
         self.last_total = total
-        self.last_busy = busy
+
+        delta = [now - last for now, last in zip(parts, self.last)]
+        fraction = [d / total_delta for d in delta]
+        self.last = parts
+
+        if len(fraction) < 10:
+            fraction.extend(0.0 for _ in range(10 - len(fraction)))
+        user, nice, kern, idle, iowait, irq, soft, steal, guser, gnice = fraction
+        fgs = [self.get_gradient(v, 0.0, 1.0, lh, hh, ls, hs, lv, hv)
+               for v, lh, hh, ls, hs, lv, hv in
+               zip(fraction,
+                   self.low_hues, self.high_hues,
+                   self.low_sats, self.high_sats,
+                   self.low_vals, self.high_vals,
+               )
+        ]
 
         block = super().run_common(short)
-        block['full_text'] = self.get_vert_bar(value) if self.short else self.get_bar(value)
-        block['color'] = self.get_gradient(value)
+        block['full_text'] = ''.join(
+            self.get_vert_bar(v, fg=fg, bg=bg)
+            if self.short else
+            self.get_bar(v, fg=fg, bg=bg)
+            for v, fg, bg in zip(fraction, fgs, self.bgs)
+        )
         return block
 
 class MemBarProvider(Provider):
@@ -651,6 +676,25 @@ class CentClockProvider(Provider):
             'color': self.color,
             'markup': 'pango',
         })
+        return block
+
+class UNIXClockProvider(Provider):
+    format = '{ut:.3f}'
+    format_short = 'UT'
+    clock = time.CLOCK_REALTIME
+    color = '#777777'
+
+    def run(self):
+        block = super().run()
+        block.update(
+            full_text = self.format.format(ut = time.clock_gettime(self.clock)),
+            color = self.color
+        )
+        return block
+
+    def run_short(self):
+        block = super().run_short()
+        block.update(full_text = self.format_short, color = self.color)
         return block
 
 class UTDiffClockProvider(SimpleClockProvider):
@@ -759,6 +803,11 @@ if __name__ == '__main__':
     sc = SimpleClockProvider()
     sc.short = False
     sc.priority = 10
+    ut1 = UNIXClockProvider()
+    ut2 = UNIXClockProvider()
+    ut2.clock = time.CLOCK_MONOTONIC
+    ut2.color = '#000077'
+    ut2.format_short = 'BT'
     st = Status(
         dp_root,
         #dp_home,
@@ -768,6 +817,8 @@ if __name__ == '__main__':
         la,
         CPUBarProvider(),
         MemBarProvider(),
+        ut2,
+        ut1,
         CentClockProvider(),
         UTDiffClockProvider(),
         sc,
