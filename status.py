@@ -253,7 +253,7 @@ class Provider(object):
         return '#{:02x}{:02x}{:02x}'.format(r, g, b)
 
     BARS = [' ', '▏', '▎', '▍', '▌', '▋', '▋', '▊', '▊', '█']
-    BLOCK = '█' 
+    BLOCK = '█'
 
     def get_bar(self, v, l=0.0, h=1.0, bg=None, fg=None):
         p = int(100.0 * (v - l) / (h - l))
@@ -267,6 +267,22 @@ class Provider(object):
         if not (fgs or bgs):
             return b
         return f'<span{fgs}{bgs}>{b}</span>'
+
+    # 1 is over, 2 is under
+    def get_stacked_bar(self, v1, v2, l1=0.0, h1=0.0, l2=0.0, h2=0.0,
+            bg=None, fg1=None, fg2=None):
+        bgs = f' background="{bg}' if bg is not None else ''
+        b1 = self.get_bar(v1, l1, h1)
+        b2 = self.get_bar(v2, l2, h2)
+        out = [' '] * 10
+        for i in range(10):
+            if b1[i] == self.BLOCK:
+                out[i] = f'<span foreground="{fg1}">{self.BLOCK}</span>'
+            elif b2[i] == self.BLOCK:
+                out[i] = f'<span background="{fg2}" foreground="{fg1}">{b1[i]}</span>'
+            else:
+                out[i] = f'<span{bgs} foreground="{fg2}">{b2[i]}</span>'
+        return ''.join(out)
 
     VERTS = ' _▁▂▃▄▅▆▇█'
 
@@ -585,12 +601,69 @@ class MemBarProvider(Provider):
     low_hue = 1.0/3.0
     high_hue = 0.0
 
+    commit_low_hue = 2.0/3.0
+    commit_high_hue = 5.0/6.0
+
+    def __init__(self):
+        self.f = None
+
+    @staticmethod
+    def file_to_dict(f):
+        ret = {}
+
+        for ln in f:
+            l, sep, r = ln.partition(':')
+            if not sep:
+                continue
+            r = r.strip()
+            if ' ' in r:
+                val, sep, unit = r.partition(' ')
+                unit = unit.strip()
+                r = (int(val), unit)
+            else:
+                r = int(r)
+            ret[l] = r
+
+        return ret
+
     def run_common(self, short = False):
         vmem = psutil.virtual_memory()
+        if self.f is None:
+            try:
+                self.f = open('/proc/meminfo')
+            except OSError:
+                fields = {}
+            else:
+                fields = self.file_to_dict(self.f)
+        else:
+            self.f.seek(0)
+            fields = self.file_to_dict(self.f)
 
         block = super().run_common(short)
-        block['full_text'] = self.get_vert_bar(vmem.percent, 0.0, 100.0) if short else self.get_bar(vmem.percent, 0.0, 100.0)
-        block['color'] = self.get_gradient(vmem.percent)
+        if short:
+            col = self.get_gradient(vmem.percent)
+            block['full_text'] = self.get_vert_bar(vmem.percent, 0.0, 100.0, None, col)
+            if 'CommitLimit' in fields:
+                lim, cur = fields['CommitLimit'][0], fields['Committed_AS'][0]
+                col = self.get_gradient(cur, 0.0, lim, self.commit_low_hue, self.commit_high_hue)
+                block['full_text'] += self.get_vert_bar(cur, 0.0, lim, None, col)
+        else:
+            if 'CommitLimit' in fields:
+                lim, cur = fields['CommitLimit'][0], fields['Committed_AS'][0]
+                block['full_text'] = self.get_stacked_bar(
+                        vmem.percent, cur,
+                        0.0, 100.0,
+                        0.0, lim,
+                        None,
+                        self.get_gradient(vmem.percent, 0.0, 100.0),
+                        self.get_gradient(
+                            cur, 0.0, lim,
+                            self.commit_low_hue, self.commit_high_hue,
+                        ),
+                )
+            else:
+                block['full_text'] = self.get_bar(vmem.percent, 0.0, 100.0)
+                block['color'] = self.get_gradient(vmem.percent)
         return block
 
 class DDateClockProvider(Provider):
