@@ -268,20 +268,36 @@ class Provider(object):
             return b
         return f'<span{fgs}{bgs}>{b}</span>'
 
-    # 1 is over, 2 is under
-    def get_stacked_bar(self, v1, v2, l1=0.0, h1=0.0, l2=0.0, h2=0.0,
-            bg=None, fg1=None, fg2=None):
-        bgs = f' background="{bg}' if bg is not None else ''
-        b1 = self.get_bar(v1, l1, h1)
-        b2 = self.get_bar(v2, l2, h2)
+    def get_stacked_bars(self, *bars, cumulate=True, bg=None):
+        bgs = f' background="{bg}"' if bg is not None else ''
+        total = 0
+        if cumulate:
+            renders = []
+            for v, l, h, fg in bars:
+                renders.append(
+                        (self.get_bar(
+                            v + total * (h - l),
+                            l, h,
+                        ), fg)
+                )
+                total += min(1.0, max(0.0, (v - l) / (h - l)))
+        else:
+            renders = [(self.get_bar(v, l, h), fg) for v, l, h, fg in bars]
         out = [' '] * 10
         for i in range(10):
-            if b1[i] == self.BLOCK:
-                out[i] = f'<span foreground="{fg1}">{self.BLOCK}</span>'
-            elif b2[i] == self.BLOCK:
-                out[i] = f'<span background="{fg2}" foreground="{fg1}">{b1[i]}</span>'
-            else:
-                out[i] = f'<span{bgs} foreground="{fg2}">{b2[i]}</span>'
+            for idx, data in enumerate(renders):
+                state, fg = data
+                if state[i] == self.BLOCK:
+                    out[i] = f'<span foreground="{fg}">{self.BLOCK}</span>'
+                    break
+                elif state[i] != ' ':
+                    nfs = bgs
+                    for nstate, nfg in renders[idx+1:]:
+                        if nstate[i] != ' ':
+                            nfs = f' background="{nfg}"'
+                            break
+                    out[i] = f'<span{nfs} foreground="{fg}">{state[i]}</span>'
+                    break
         return ''.join(out)
 
     VERTS = ' _▁▂▃▄▅▆▇█'
@@ -589,12 +605,17 @@ class CPUBarProvider(Provider):
         ]
 
         block = super().run_common(short)
-        block['full_text'] = ''.join(
-            self.get_vert_bar(v, fg=fg, bg=bg)
-            if self.short else
-            self.get_bar(v, fg=fg, bg=bg)
-            for v, fg, bg in zip(fraction, fgs, self.bgs)
-        )
+        if short:
+            block['full_text'] = ''.join(
+                self.get_vert_bar(v, fg=fg, bg=bg)
+                for v, fg, bg in zip(fraction, fgs, self.bgs)
+            )
+        else:
+            # Omit idle time in this view
+            del fraction[3], fgs[3]
+            block['full_text'] = self.get_stacked_bars(
+                    *((v, 0.0, 1.0, fg) for v, fg in zip(fraction, fgs))
+            )
         return block
 
 class MemBarProvider(Provider):
@@ -650,16 +671,13 @@ class MemBarProvider(Provider):
         else:
             if 'CommitLimit' in fields:
                 lim, cur = fields['CommitLimit'][0], fields['Committed_AS'][0]
-                block['full_text'] = self.get_stacked_bar(
-                        vmem.percent, cur,
-                        0.0, 100.0,
-                        0.0, lim,
-                        None,
-                        self.get_gradient(vmem.percent, 0.0, 100.0),
-                        self.get_gradient(
-                            cur, 0.0, lim,
-                            self.commit_low_hue, self.commit_high_hue,
-                        ),
+                block['full_text'] = self.get_stacked_bars(
+                        (vmem.percent, 0.0, 100.0,
+                            self.get_gradient(vmem.percent, 0.0, 100.0)),
+                        (cur, 0.0, lim,
+                            self.get_gradient(cur, 0.0, lim,
+                                self.commit_low_hue, self.commit_high_hue)),
+                        cumulate = False,
                 )
             else:
                 block['full_text'] = self.get_bar(vmem.percent, 0.0, 100.0)
