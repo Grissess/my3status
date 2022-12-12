@@ -15,11 +15,11 @@ class SleepWaiter(object):
         await asyncio.sleep(self.interval)
 
 class SleepBiasWaiter(object):
-    def __init__(self, interval, bias = 0.0, corr = 0.1, icorr = 0.5, minint = 0.25, clock = time.CLOCK_REALTIME):
-        self.interval, self.bias, self.clock = interval, bias, clock
+    def __init__(self, intervals, bias = 0.0, corr = 0.1, icorr = 0.5, minint = 0.25, clock = time.CLOCK_REALTIME):
+        self.intervals, self.bias, self.clock = intervals, bias, clock
         self.corr, self.icorr, self.minint = corr, icorr, minint
         self.bias_corr = 0.0
-        self.interval_corr = 1.0
+        self.interval_corrs = [1.0] * len(intervals)
         self.reset = True
         self.start = None
 
@@ -77,8 +77,8 @@ class PosixTimerWaiter(object):
     )
     TIMER_ABSTIME = 1
 
-    def __init__(self, interval, clock = time.CLOCK_REALTIME):
-        self.interval = interval
+    def __init__(self, intervals, clock = time.CLOCK_REALTIME):
+        self.intervals = intervals
         self.lib = ctypes.CDLL('librt.so.1')
         self.timer_create = self.f_timer_create(('timer_create', self.lib), self.pi_timer_create)
         self.timer_settime = self.f_timer_settime(('timer_settime', self.lib), self.pi_timer_settime)
@@ -102,7 +102,7 @@ class PosixTimerWaiter(object):
     async def wait(self):
         self.install_sighand()
         now = time.clock_gettime(self.clock)
-        nxt = math.ceil(now / self.interval) * self.interval
+        nxt = min(math.ceil(now / i) * i for i in self.intervals)
         nxs = int(nxt)
         nxns = int(1e9 * (nxt - nxs))
         self.timer_settime(
@@ -114,7 +114,7 @@ class PosixTimerWaiter(object):
             await self.gate.wait()
 
 class Status(object):
-    def __init__(self, *providers, waiter = SleepBiasWaiter(0.5)):
+    def __init__(self, *providers, waiter = SleepBiasWaiter((0.5,))):
         self.providers = list(providers)
         self.idmap = {id(provider): provider for provider in providers}
         self.reschedule()
@@ -769,6 +769,27 @@ class CentClockProvider(Provider):
         })
         return block
 
+class DecClockProvider(Provider):
+    format_short = '{dh:01d}:{dm:02d}:{ds:02d}'
+    format = format_short + '.{sf:.3f}'
+    color = '#007777'
+
+    def run_common(self, short = False):
+        now = time.clock_gettime(time.CLOCK_REALTIME)
+        tinfo = getattr(self, 'timefunc', time.localtime)(now)
+        secs = tinfo.tm_hour * 3600 + tinfo.tm_min * 60 + tinfo.tm_sec
+        frac = secs / 86400
+        dh, dm, ds = int((10 * frac) % 10), int((frac * 1000) % 100), round((frac * 100000) % 100)
+        sf = (frac * 100000) % 1
+        block = super().run_common(short)
+        fmt = self.format_short if short else self.format
+        block.update({
+            'full_text': fmt.format(dh=dh, dm=dm, ds=ds, sf=sf),
+            'color': self.color,
+            'markup': 'pango',
+        })
+        return block
+
 class UNIXClockProvider(Provider):
     format = '{ut:.3f}'
     format_short = 'UT'
@@ -823,13 +844,13 @@ class UTDiffClockProvider(SimpleClockProvider):
         return block
 
 class WaiterInfo(Provider):
-    other_format = 'I:{intv:.02f},SB:{sowb:.03f},EB:{eowb:.03f}'
+    other_format = 'I:{intv},SB:{sowb:.03f},EB:{eowb:.03f}'
     other_format_short = 'TC'
 
-    sbw_format = 'I:{intv:.02f},dT:{bias:.03f},dI:{ival:.03f},SB:{sowb:.03f},EB:{eowb:.03f}'
+    sbw_format = 'I:{intv},dT:{bias:.03f},dI:{ival:.03f},SB:{sowb:.03f},EB:{eowb:.03f}'
     sbw_format_short = 'TC'
 
-    times = (0.01, 0.05, 0.1, 0.5, 1.0)
+    times = ((0.01,), (0.05,), (0.1,), (0.5,), (0.864, 1.0), (1.0,))
     time_cur = 4
 
     def __init__(self, waiter):
@@ -837,15 +858,15 @@ class WaiterInfo(Provider):
 
     def run_common(self, short = False):
         block = super().run_common(short)
-        intv = self.waiter.interval
+        intv = self.waiter.intervals
         sowt = getattr(self.waiter, 'start_time', 0.0)
         eowt = getattr(self.waiter, 'end_time', 0.0)
         common = {
                 'intv': intv,
                 'sowt': sowt,
                 'eowt': eowt,
-                'sowb': sowt % intv,
-                'eowb': eowt % intv,
+                'sowb': min(sowt % i for i in intv),
+                'eowb': min(eowt % i for i in intv),
         }
         if isinstance(self.waiter, SleepBiasWaiter):
             block['full_text'] = (self.sbw_format_short if short else self.sbw_format).format(
@@ -887,12 +908,14 @@ if __name__ == '__main__':
     bp.voltage_high = 8.45
     # A little bias to keep the bar clock ticking at a consistent rate
     #waiter = SleepBiasWaiter(1.0)
-    waiter = PosixTimerWaiter(1.0)
+    waiter = PosixTimerWaiter((1.0, 0.864))
     bsi = WaiterInfo(waiter)
     bsi.color = '#770077'
     #bsi.short = False
     sc = SimpleClockProvider()
     sc.short = False
+    sc.priority = 10
+    dc = DecClockProvider()
     sc.priority = 10
     ut1 = UNIXClockProvider()
     ut2 = UNIXClockProvider()
@@ -910,7 +933,7 @@ if __name__ == '__main__':
         MemBarProvider(),
         ut2,
         ut1,
-        CentClockProvider(),
+        dc,
         UTDiffClockProvider(),
         sc,
         DDateClockProvider(),
