@@ -439,8 +439,8 @@ class TemperatureProvider(Provider):
 
 
 class BatteryProvider(Provider):
-    format = '{status} {remaining} {flow} {voltage} {percentage:.2f}% {bar}'
-    format_short = '{status}{percentage:.2f}%{vert_bar}'
+    format = '<span foreground="{status_color}">{status}</span> {remaining} {flow} {voltage} {percentage:.2f}% {bar}'
+    format_short = '<span foreground="{status_color}">{status}</span>{percentage:.2f}%{vert_bar}'
 
     missing_color = '#ff00ff'
     missing_urgent = False
@@ -460,6 +460,13 @@ class BatteryProvider(Provider):
         'Full': '→',
         'Unknown': '',
     }
+    STATUS_COLORS = {
+        'Discharging': '#ff0000',
+        'Charging': '#00ff00',
+        'Depleted': '#ff00ff',
+        'Full': '#0000ff',
+    }
+    STATUS_COLOR_DEFAULT = '#ffff00'
     MICRO_UNITS = re.compile(r'VOLTAGE|CHARGE|CURRENT|POWER|ENERGY')
 
     def __init__(self, battery='BAT0'):
@@ -508,16 +515,21 @@ class BatteryProvider(Provider):
         h, m = None, None
         if 'ENERGY_NOW' in info:
             partial = info['ENERGY_NOW'] / info['ENERGY_FULL']
-            info['flow'] = '{:.2f}W'.format(info['POWER_NOW'])
+            flow = info.get('POWER_NOW', 0.0)
+            info['flow'] = '{:.2f}W'.format(flow)
             energy_target = info['ENERGY_NOW'] if info['STATUS'] == 'Discharging' else (info['ENERGY_FULL'] - info['ENERGY_NOW'])
-            if energy_target > 0 and info['POWER_NOW'] > 0:
-                h, m = divmod(energy_target / info['POWER_NOW'] * 60.0, 60.0)
-        else:
+            if energy_target > 0 and flow > 0:
+                h, m = divmod(energy_target / flow * 60.0, 60.0)
+        elif 'CHARGE_NOW' in info:
             partial = info['CHARGE_NOW'] / info['CHARGE_FULL']
-            info['flow'] = '{:.3f}A'.format(info['CURRENT_NOW'])
+            flow = info.get('CURRENT_NOW', 0.0)
+            info['flow'] = '{:.3f}A'.format(flow)
             energy_target = info['CHARGE_NOW'] if info['STATUS'] == 'Discharging' else (info['CHARGE_FULL'] - info['CHARGE_NOW'])
-            if energy_target > 0 and info['CURRENT_NOW'] > 0:
-                h, m = divmod(energy_target / info['CURRENT_NOW'] * 60.0, 60.0)
+            if energy_target > 0 and flow > 0:
+                h, m = divmod(energy_target / flow * 60.0, 60.0)
+        else:
+            partial = 0.0
+            info['flow'] = '?'
         info['remaining'] = '{}h{:02}m'.format(int(h), int(m)) if h is not None else ''
         vmin, vnow = info['VOLTAGE_MIN_DESIGN'], info['VOLTAGE_NOW']
         info['voltage'] = '<span foreground="{}">{}V</span>'.format(
@@ -529,6 +541,7 @@ class BatteryProvider(Provider):
         info['vert_bar'] = self.get_vert_bar(partial)
         info['percentage'] = 100.0 * partial
         info['partial'] = partial
+        info['status_color'] = self.STATUS_COLORS.get(info['STATUS'], self.STATUS_COLOR_DEFAULT)
 
         return info
 
@@ -897,6 +910,30 @@ class WaiterInfo(Provider):
             return True
         return False
 
+class FileContentProvider(Provider):
+    not_found = '<NF>'
+    not_found_color = '#000033'
+
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def get_content(self):
+        try:
+            return open(self.fn).read()
+        except OSError:
+            return None
+
+    def run_common(self, short=False):
+        block = super().run_common(short)
+        content = self.get_content().strip()
+        if content is None:
+            block['color'] = self.not_found_color
+            block['full_text'] = self.not_found
+            return block
+        block['full_text'] = content
+        return block
+
 if __name__ == '__main__':
     dp_root = DiskProvider('/')
     dp_root.color = '#0077ff'
@@ -922,15 +959,24 @@ if __name__ == '__main__':
     ut2.clock = time.CLOCK_MONOTONIC
     ut2.color = '#000077'
     ut2.format_short = 'BT'
+    net = NetworkProvider()
+    net.short = False
+    cpub = CPUBarProvider()
+    cpub.short = False
+    memb = MemBarProvider()
+    memb.short = False
+    notif = FileContentProvider('/run/notifications')
+    notif.color = '#000077'
     st = Status(
+        notif,
         dp_root,
         #dp_home,
-        NetworkProvider(),
+        net,
         *TemperatureProvider.all(),
         bp,
         la,
-        CPUBarProvider(),
-        MemBarProvider(),
+        cpub,
+        memb,
         ut2,
         ut1,
         dc,
