@@ -29,6 +29,28 @@ the same name](https://github.com/alexbakker/my3status), which I discovered
 afterward, and seems both functionally equivalent and more professional than
 this :)
 
+Installation
+------------
+
+As it's already gitignored and shebanged, the best place to put a Python Venv
+is in `venv`. Thus, from this repository:
+
+```
+python3 -m venv venv
+. venv/bin/activate
+pip3 install -r requirements.txt
+```
+
+Then you can `./status.py` from within the same directory.
+
+If you don't have control over the directory, the somewhat longer invocation
+
+```
+$REPO/venv/bin/python $REPO/status.py
+```
+
+will also suffice, provided `$REPO` refers to this repository root.
+
 Usage
 -----
 

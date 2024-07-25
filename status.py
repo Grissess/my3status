@@ -1,3 +1,4 @@
+#!venv/bin/python
 import json, sys, time, os, colorsys, re, multiprocessing, asyncio, concurrent.futures, traceback, math, ctypes, signal
 
 import netifaces, psutil, ddate.base
