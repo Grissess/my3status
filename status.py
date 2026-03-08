@@ -1,5 +1,5 @@
 #!venv/bin/python
-import json, sys, time, os, colorsys, re, multiprocessing, asyncio, concurrent.futures, traceback, math, ctypes, signal
+import json, sys, time, os, colorsys, re, multiprocessing, asyncio, concurrent.futures, traceback, math, ctypes, signal, datetime, zoneinfo
 
 import netifaces, psutil, ddate.base
 
@@ -406,6 +406,18 @@ class NetworkProvider(Provider):
         block['full_text'] = 'NET'
         return block
 
+    def click(self, block):
+        if super().click(block):
+            return True
+        if block['button'] in (4, 5):
+            if block['button'] == 4:
+                self.af_priority = (self.af_priority[-1],) + self.af_priority[:-1]
+            else:
+                self.af_priority = self.af_priority[1:] + (self.af_priority[0],)
+            return True
+        return False
+
+
 class TemperatureProvider(Provider):
     low_value = 20.0
     low_hue = 2.0/3.0
@@ -743,6 +755,7 @@ class SimpleClockProvider(Provider):
     format = '%Y-%m-%d<span color="#0000ff">T</span>%H:%M:%S<span color="#555555">.%Nm</span><span color="#007700">%z %Z W%W J%j</span>'
     format_short = '%H:%M:%S<span foreground="#555555">.%Nd</span>'
     subsecs_pattern = re.compile('%N([dcmunf])')
+    dt_factory = datetime.datetime.fromtimestamp
 
     def run_common(self, short = False):
         block = super().run_common(short)
@@ -761,7 +774,7 @@ class SimpleClockProvider(Provider):
             return subs[mo.group(1)]
         fo = self.subsecs_pattern.sub(repl, self.format_short if short else self.format)
         block.update({
-            'full_text': time.strftime(fo, getattr(self, 'timefunc', time.localtime)(now)),
+            'full_text': self.dt_factory(now).strftime(fo),
             'color': self.color,
             'markup': 'pango',
         })
@@ -865,7 +878,7 @@ class WaiterInfo(Provider):
     sbw_format_short = 'TC'
 
     times = ((0.01,), (0.05,), (0.1,), (0.5,), (0.864, 1.0), (1.0,))
-    time_cur = 4
+    time_cur = 5
 
     def __init__(self, waiter):
         self.waiter = waiter
@@ -915,15 +928,19 @@ class FileContentProvider(Provider):
     not_found = '<NF>'
     not_found_color = '#000033'
 
-    def __init__(self, fn):
+    def __init__(self, fn, f=None):
         super().__init__()
         self.fn = fn
+        self.f = f
 
     def get_content(self):
-        try:
-            return open(self.fn).read()
-        except OSError:
-            return None
+        if self.f is None:
+            try:
+                self.f = open(self.fn)
+            except OSError:
+                return None
+        self.f.seek(0)
+        return self.f.read()
 
     def run_common(self, short=False):
         block = super().run_common(short)
@@ -944,15 +961,21 @@ if __name__ == '__main__':
     la.color = '#000077'
     bp = BatteryProvider()
     bp.voltage_high = 8.45
+    bp.short = False
     # A little bias to keep the bar clock ticking at a consistent rate
     #waiter = SleepBiasWaiter(1.0)
-    waiter = PosixTimerWaiter((1.0, 0.864))
+    waiter = PosixTimerWaiter((1.0,))
     bsi = WaiterInfo(waiter)
     bsi.color = '#770077'
     #bsi.short = False
     sc = SimpleClockProvider()
     sc.short = False
     sc.priority = 10
+    tsc = SimpleClockProvider()
+    tsc.short = False
+    tsc.priority = 10
+    tsc.color = '#ff77ff'
+    tsc.dt_factory = lambda now: datetime.datetime.fromtimestamp(now, zoneinfo.ZoneInfo('America/Chicago'))
     dc = DecClockProvider()
     sc.priority = 10
     ut1 = UNIXClockProvider()
@@ -967,7 +990,7 @@ if __name__ == '__main__':
     memb = MemBarProvider()
     memb.short = False
     notif = FileContentProvider('/run/notifications')
-    notif.color = '#000077'
+    notif.color = '#7700ff'
     st = Status(
         notif,
         dp_root,
@@ -980,8 +1003,9 @@ if __name__ == '__main__':
         memb,
         ut2,
         ut1,
-        dc,
+        #dc,
         UTDiffClockProvider(),
+        #tsc,
         sc,
         DDateClockProvider(),
         bsi,
